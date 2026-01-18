@@ -3,11 +3,10 @@
 > Part of the EasyCash ecosystem - Privacy-first stablecoin banking protocol
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![$ECASH](https://img.shields.io/badge/Token-$ECASH-Live-blue)](https://easycash.finance)
 
 ## Overview
 
-Stealth address library for private payments on Ethereum. Generate one-time addresses so senders can pay you without linking to your main wallet. Based on EIP-5564 standard.
+Stealth address library for private payments on Solana. Generate one-time addresses so senders can pay you without linking to your main wallet. Based on EIP-5564 standard.
 
 ## Features
 
