@@ -1,5 +1,5 @@
 /**
- * Core types for stealth address operations
+ * Core types for stealth address operations (Solana Version)
  */
 
 export interface KeyPair {
@@ -18,24 +18,24 @@ export interface StealthMetaAddress {
 }
 
 export interface StealthAddressResult {
-  stealthAddress: string;
+  stealthAddress: Base58String;
   ephemeralPublicKey: Uint8Array;
   viewTag: number;
 }
 
 export interface RecoveredAddress {
-  address: string;
+  address: Base58String;
   privateKey: Uint8Array;
 }
 
 export interface StealthAnnouncement {
-  stealthAddress: string;
-  ephemeralPublicKey: string;
+  stealthAddress: Base58String;
+  ephemeralPublicKey: Base58String; // Store physically as base58 string in announcements
   viewTag: number;
   timestamp: number;
 }
 
-export type HexString = `0x${string}`;
+export type Base58String = string;
 
 /**
  * Options for batch scanning announcements
