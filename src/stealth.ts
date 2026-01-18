@@ -1,6 +1,6 @@
 /**
- * Stealth Address Implementation
- * Based on EIP-5564 standard for stealth addresses
+ * Solana Stealth Address Implementation
+ * Adapted from EIP-5564 logic but using Ed25519/Solana primitives.
  *
  * Flow:
  * 1. Receiver generates stealth meta-address (spending + viewing keys)
@@ -13,17 +13,15 @@ import {
   generateKeyPair,
   getPublicKey,
   computeSharedSecret,
-  keccak256,
-  publicKeyToAddress,
+  hashSharedSecret,
   pointAdd,
   scalarAdd,
   extractViewTag,
-  bytesToHex,
-  hexToBytes,
+  bytesToBase58,
+  base58ToBytes,
   isValidPublicKey,
-  isValidHex,
   CryptoError,
-} from './crypto';
+} from "./crypto";
 
 import type {
   StealthKeys,
@@ -31,10 +29,8 @@ import type {
   StealthAddressResult,
   RecoveredAddress,
   StealthAnnouncement,
-  HexString,
   ScanOptions,
-  ScanProgress,
-} from './types';
+} from "./types";
 
 const DEFAULT_BATCH_SIZE = 100;
 
@@ -62,89 +58,125 @@ export function getStealthMetaAddress(keys: StealthKeys): StealthMetaAddress {
 
 /**
  * Encode stealth meta-address to string format
- * Format: st:eth:0x<spendingPubKey><viewingPubKey>
+ * Format: sol:st:<spendingBase58>:<viewingBase58>
+ * (Custom format for Solana)
  */
 export function encodeStealthMetaAddress(meta: StealthMetaAddress): string {
   if (!isValidPublicKey(meta.spendingPublicKey)) {
-    throw new CryptoError('Invalid spending public key', 'INVALID_PUBLIC_KEY');
+    throw new CryptoError("Invalid spending public key", "INVALID_PUBLIC_KEY");
   }
   if (!isValidPublicKey(meta.viewingPublicKey)) {
-    throw new CryptoError('Invalid viewing public key', 'INVALID_PUBLIC_KEY');
+    throw new CryptoError("Invalid viewing public key", "INVALID_PUBLIC_KEY");
   }
-  const spending = bytesToHex(meta.spendingPublicKey).slice(2);
-  const viewing = bytesToHex(meta.viewingPublicKey).slice(2);
-  return `st:eth:0x${spending}${viewing}`;
+  const spending = bytesToBase58(meta.spendingPublicKey);
+  const viewing = bytesToBase58(meta.viewingPublicKey);
+  return `sol:st:${spending}:${viewing}`;
 }
 
 /**
  * Decode stealth meta-address from string format
  */
 export function decodeStealthMetaAddress(encoded: string): StealthMetaAddress {
-  const prefix = 'st:eth:0x';
+  const prefix = "sol:st:";
   if (!encoded.startsWith(prefix)) {
-    throw new CryptoError('Invalid stealth meta-address format: missing prefix', 'INVALID_FORMAT');
-  }
-
-  const data = encoded.slice(prefix.length);
-  const keyLength = 66; // 33 bytes compressed public key = 66 hex chars
-
-  if (data.length !== keyLength * 2) {
     throw new CryptoError(
-      `Invalid stealth meta-address length: expected ${keyLength * 2}, got ${data.length}`,
-      'INVALID_LENGTH'
+      "Invalid stealth meta-address format: missing prefix",
+      "INVALID_FORMAT",
     );
   }
 
-  if (!isValidHex(data)) {
-    throw new CryptoError('Invalid hex in stealth meta-address', 'INVALID_HEX');
+  const parts = encoded.slice(prefix.length).split(":");
+  if (parts.length !== 2) {
+    throw new CryptoError(
+      "Invalid stealth meta-address format: expected 2 keys",
+      "INVALID_FORMAT",
+    );
   }
 
-  const spendingPublicKey = hexToBytes(data.slice(0, keyLength));
-  const viewingPublicKey = hexToBytes(data.slice(keyLength));
+  const [spendingStr, viewingStr] = parts;
 
-  if (!isValidPublicKey(spendingPublicKey)) {
-    throw new CryptoError('Invalid spending public key in meta-address', 'INVALID_PUBLIC_KEY');
-  }
-  if (!isValidPublicKey(viewingPublicKey)) {
-    throw new CryptoError('Invalid viewing public key in meta-address', 'INVALID_PUBLIC_KEY');
-  }
+  try {
+    const spendingPublicKey = base58ToBytes(spendingStr);
+    const viewingPublicKey = base58ToBytes(viewingStr);
 
-  return { spendingPublicKey, viewingPublicKey };
+    if (!isValidPublicKey(spendingPublicKey)) {
+      throw new CryptoError(
+        "Invalid spending public key in meta-address",
+        "INVALID_PUBLIC_KEY",
+      );
+    }
+    if (!isValidPublicKey(viewingPublicKey)) {
+      throw new CryptoError(
+        "Invalid viewing public key in meta-address",
+        "INVALID_PUBLIC_KEY",
+      );
+    }
+
+    return { spendingPublicKey, viewingPublicKey };
+  } catch (e) {
+    if (e instanceof CryptoError) throw e;
+    throw new CryptoError("Failed to decode Base58 keys", "INVALID_BASE58");
+  }
 }
 
 /**
- * Generate a stealth address for sending funds
- * Called by the sender with receiver's meta-address
+ * Generate a stealth address for sending funds on Solana
+ *
+ * Logic:
+ * 1. Generate ephemeral key pair (r, R)
+ * 2. Compute shared secret S = r * V (where V is viewing pubkey)
+ * 3. Hash S to get scalar h
+ * 4. Compute stealth pubkey P_stealth = P_spend + h * G
+ * 5. Stealth address = Base58(P_stealth)
  *
  * @param metaAddress - Receiver's stealth meta-address
  * @returns Stealth address, ephemeral public key, and view tag
  */
 export function generateStealthAddress(
-  metaAddress: StealthMetaAddress
+  metaAddress: StealthMetaAddress,
 ): StealthAddressResult {
   if (!isValidPublicKey(metaAddress.spendingPublicKey)) {
-    throw new CryptoError('Invalid spending public key in meta-address', 'INVALID_PUBLIC_KEY');
+    throw new CryptoError(
+      "Invalid spending public key in meta-address",
+      "INVALID_PUBLIC_KEY",
+    );
   }
   if (!isValidPublicKey(metaAddress.viewingPublicKey)) {
-    throw new CryptoError('Invalid viewing public key in meta-address', 'INVALID_PUBLIC_KEY');
+    throw new CryptoError(
+      "Invalid viewing public key in meta-address",
+      "INVALID_PUBLIC_KEY",
+    );
   }
 
+  // 1. Ephemeral Key
   const ephemeral = generateKeyPair();
 
-  const sharedSecret = computeSharedSecret(
+  // 2. Shared Secret (S = r * V)
+  // Input: ephemeral private key (scalar), viewing public key (point)
+  const sharedSecretPoint = computeSharedSecret(
     ephemeral.privateKey,
-    metaAddress.viewingPublicKey
+    metaAddress.viewingPublicKey,
   );
 
-  const sharedSecretHash = keccak256(sharedSecret);
+  // 3. Hash shared secret to get blinding factor/scalar
+  // Use hashSharedSecret to get random bytes, then interpret as scalar
+  const sharedSecretHash = hashSharedSecret(sharedSecretPoint);
+
+  // 4. View Tag (for parsing)
   const viewTag = extractViewTag(sharedSecretHash);
 
+  // 5. Compute Stealth Public Key
+  // P_stealth = P_spend + hash(S) * G
+  // We need G * hash(S). Since we don't have direct "mul base" exposed easily in our crypto utils
+  // w/o circular dep or extra code, we can use getPublicKey() which does scalar * G.
+  const blindingPoint = getPublicKey(sharedSecretHash); // P_blind = H(S) * G
   const stealthPublicKey = pointAdd(
     metaAddress.spendingPublicKey,
-    getPublicKey(sharedSecretHash)
+    blindingPoint,
   );
 
-  const stealthAddress = publicKeyToAddress(stealthPublicKey);
+  // 6. Address
+  const stealthAddress = bytesToBase58(stealthPublicKey);
 
   return {
     stealthAddress,
@@ -155,21 +187,25 @@ export function generateStealthAddress(
 
 /**
  * Check if a stealth address belongs to the receiver using view tag
- * Fast check before doing full computation
  *
  * @param viewingPrivateKey - Receiver's viewing private key
  * @param ephemeralPublicKey - From announcement
  * @param expectedViewTag - From announcement
- * @returns true if view tag matches (likely belongs to receiver)
+ * @returns true if view tag matches
  */
 export function checkStealthAddress(
   viewingPrivateKey: Uint8Array,
   ephemeralPublicKey: Uint8Array,
-  expectedViewTag: number
+  expectedViewTag: number,
 ): boolean {
   try {
-    const sharedSecret = computeSharedSecret(viewingPrivateKey, ephemeralPublicKey);
-    const sharedSecretHash = keccak256(sharedSecret);
+    // S = v * R (where v is viewing private key, R is ephemeral pubkey)
+    // Diffie-Hellman: r * V == v * R
+    const sharedSecretPoint = computeSharedSecret(
+      viewingPrivateKey,
+      ephemeralPublicKey,
+    );
+    const sharedSecretHash = hashSharedSecret(sharedSecretPoint);
     const computedViewTag = extractViewTag(sharedSecretHash);
     return computedViewTag === expectedViewTag;
   } catch {
@@ -179,7 +215,9 @@ export function checkStealthAddress(
 
 /**
  * Recover the stealth address private key
- * Called by receiver after confirming ownership
+ *
+ * Logic:
+ * p_stealth = p_spend + hash(S)
  *
  * @param spendingPrivateKey - Receiver's spending private key
  * @param viewingPrivateKey - Receiver's viewing private key
@@ -189,15 +227,21 @@ export function checkStealthAddress(
 export function recoverStealthPrivateKey(
   spendingPrivateKey: Uint8Array,
   viewingPrivateKey: Uint8Array,
-  ephemeralPublicKey: Uint8Array
+  ephemeralPublicKey: Uint8Array,
 ): RecoveredAddress {
-  const sharedSecret = computeSharedSecret(viewingPrivateKey, ephemeralPublicKey);
-  const sharedSecretHash = keccak256(sharedSecret);
+  // Recompute shared secret
+  const sharedSecretPoint = computeSharedSecret(
+    viewingPrivateKey,
+    ephemeralPublicKey,
+  );
+  const sharedSecretHash = hashSharedSecret(sharedSecretPoint);
 
+  // Compute stealth private key: p_stealth = p_spend + hash(S) (mod curve order)
   const stealthPrivateKey = scalarAdd(spendingPrivateKey, sharedSecretHash);
 
+  // Verify address matches
   const stealthPublicKey = getPublicKey(stealthPrivateKey);
-  const address = publicKeyToAddress(stealthPublicKey);
+  const address = bytesToBase58(stealthPublicKey);
 
   return {
     address,
@@ -210,11 +254,9 @@ export function recoverStealthPrivateKey(
  */
 function isValidAnnouncement(announcement: StealthAnnouncement): boolean {
   return (
-    typeof announcement.stealthAddress === 'string' &&
-    announcement.stealthAddress.startsWith('0x') &&
-    typeof announcement.ephemeralPublicKey === 'string' &&
-    isValidHex(announcement.ephemeralPublicKey) &&
-    typeof announcement.viewTag === 'number' &&
+    typeof announcement.stealthAddress === "string" &&
+    typeof announcement.ephemeralPublicKey === "string" &&
+    typeof announcement.viewTag === "number" &&
     announcement.viewTag >= 0 &&
     announcement.viewTag <= 255
   );
@@ -222,14 +264,10 @@ function isValidAnnouncement(announcement: StealthAnnouncement): boolean {
 
 /**
  * Scan announcements to find stealth addresses belonging to receiver
- *
- * @param keys - Receiver's stealth keys
- * @param announcements - List of stealth announcements to scan
- * @returns Recovered addresses with private keys
  */
 export function scanAnnouncements(
   keys: StealthKeys,
-  announcements: StealthAnnouncement[]
+  announcements: StealthAnnouncement[],
 ): RecoveredAddress[] {
   const recovered: RecoveredAddress[] = [];
 
@@ -239,22 +277,22 @@ export function scanAnnouncements(
     }
 
     try {
-      const ephemeralPublicKey = hexToBytes(announcement.ephemeralPublicKey);
+      const ephemeralPublicKey = base58ToBytes(announcement.ephemeralPublicKey);
 
       const isMatch = checkStealthAddress(
         keys.viewingKey.privateKey,
         ephemeralPublicKey,
-        announcement.viewTag
+        announcement.viewTag,
       );
 
       if (isMatch) {
         const result = recoverStealthPrivateKey(
           keys.spendingKey.privateKey,
           keys.viewingKey.privateKey,
-          ephemeralPublicKey
+          ephemeralPublicKey,
         );
 
-        if (result.address.toLowerCase() === announcement.stealthAddress.toLowerCase()) {
+        if (result.address === announcement.stealthAddress) {
           recovered.push(result);
         }
       }
@@ -269,33 +307,23 @@ export function scanAnnouncements(
 
 /**
  * Scan announcements in batches with progress tracking
- * Better for large announcement sets - allows cancellation and progress updates
- *
- * @param keys - Receiver's stealth keys
- * @param announcements - List of stealth announcements to scan
- * @param options - Scan options including batch size and progress callback
- * @returns Recovered addresses with private keys
  */
 export async function scanAnnouncementsBatch(
   keys: StealthKeys,
   announcements: StealthAnnouncement[],
-  options: ScanOptions = {}
+  options: ScanOptions = {},
 ): Promise<RecoveredAddress[]> {
   const { batchSize = DEFAULT_BATCH_SIZE, onProgress, signal } = options;
   const recovered: RecoveredAddress[] = [];
   const total = announcements.length;
 
   for (let i = 0; i < total; i += batchSize) {
-    // Check for cancellation
-    if (signal?.aborted) {
-      break;
-    }
+    if (signal?.aborted) break;
 
     const batch = announcements.slice(i, i + batchSize);
     const batchResults = scanAnnouncements(keys, batch);
     recovered.push(...batchResults);
 
-    // Report progress
     if (onProgress) {
       const processed = Math.min(i + batchSize, total);
       onProgress({
@@ -306,7 +334,6 @@ export async function scanAnnouncementsBatch(
       });
     }
 
-    // Yield to event loop for responsiveness
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 
@@ -317,27 +344,27 @@ export async function scanAnnouncementsBatch(
  * Create an announcement object for publishing
  */
 export function createAnnouncement(
-  result: StealthAddressResult
+  result: StealthAddressResult,
 ): StealthAnnouncement {
   return {
     stealthAddress: result.stealthAddress,
-    ephemeralPublicKey: bytesToHex(result.ephemeralPublicKey),
+    ephemeralPublicKey: bytesToBase58(result.ephemeralPublicKey),
     viewTag: result.viewTag,
     timestamp: Date.now(),
   };
 }
 
 /**
- * Utility: Get stealth meta-address as checksummed string
+ * Utility: Get stealth meta-address details
  */
 export function formatMetaAddress(meta: StealthMetaAddress): {
-  spending: HexString;
-  viewing: HexString;
+  spending: string;
+  viewing: string;
   encoded: string;
 } {
   return {
-    spending: bytesToHex(meta.spendingPublicKey),
-    viewing: bytesToHex(meta.viewingPublicKey),
+    spending: bytesToBase58(meta.spendingPublicKey),
+    viewing: bytesToBase58(meta.viewingPublicKey),
     encoded: encodeStealthMetaAddress(meta),
   };
 }
